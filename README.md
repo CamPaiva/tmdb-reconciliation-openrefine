@@ -16,7 +16,7 @@ This service allows you to reconcile a column of film titles in OpenRefine again
 
 The service is designed to handle international cinema well, including films with translated titles, accented characters, and directors whose names are romanised differently across sources.
 
-Currently, the service reconciles film titles to their corresponding TMDB pages and IDs. **Data extension — which will allow users to add new columns from reconciled values (such as cast, director, runtime, genres, and more) — is planned for a future release.**
+Currently, the service reconciles film titles to their corresponding TMDB pages and IDs. Data extension — which will allow users to add new columns from reconciled values (such as cast, director, runtime, genres, and more) — is planned for a future release.
 
 ---
 
@@ -95,8 +95,6 @@ These additional columns significantly improve matching accuracy, especially for
 - Films with very common translated titles (e.g. "Mirror", "Daisies") may require year and/or director information to match correctly
 
 ---
-
-## License
 
 ## License
 
