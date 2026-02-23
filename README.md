@@ -43,12 +43,7 @@ pip install -r requirements.txt
 
 **3. Set up your TMDB API key**
 
-Copy the example environment file and add your API key:
-```bash
-cp .env.example .env
-```
-
-Then open `.env` and replace `your_tmdb_api_key_here` with your actual key:
+In your project folder, make a copy of `.env.example` and rename the copy to `.env`. Then open `.env` and replace `your_tmdb_api_key_here` with your actual TMDB API key:
 ```
 TMDB_API_KEY=your_actual_key_here
 ```
@@ -73,7 +68,6 @@ You should see:
 - Click the dropdown on your film title column → **Reconcile → Start reconciling**
 - Click **Add Standard Service** in the bottom left
 - Enter: `http://127.0.0.1:5000/reconcile`
-- Click **Add Service** and select **TMDB Movie Reconciliation**
 
 **3. Optionally map additional columns**
 
@@ -83,20 +77,16 @@ In the reconciliation dialog, under **"Also use relevant details from other colu
 - A director column → **Director**
 - A country column → **Country**
 
-These additional columns significantly improve matching accuracy, especially for international films and films with common titles.
-
+- **Title + year is the recommended combination** — it is faster (no extra API calls) and handles the vast majority of cases well
 ---
 
 ## Notes
 
 - The server must be running whenever you use the service in OpenRefine
-- **Title + year is the recommended combination** — it is fast (no extra API calls) and handles the vast majority of cases well
 - Using director and/or country columns improves accuracy for ambiguous cases but will slow down reconciliation, as additional API calls are made to TMDB for each candidate
 - Films with very common translated titles (e.g. "Mirror", "Daisies") may require year and/or director information to match correctly
 
 ---
-
-## License
 
 ## License
 
