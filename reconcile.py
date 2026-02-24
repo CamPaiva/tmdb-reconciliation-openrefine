@@ -37,7 +37,7 @@ TMDB_DETAILS_URL = "https://api.themoviedb.org/3/movie/{}"
 
 # The base URL OpenRefine will use to build links back to this service.
 # Change this if you deploy the service somewhere other than localhost.
-SERVICE_BASE_URL = "http://127.0.0.1:5000"
+SERVICE_BASE_URL = os.getenv("SERVICE_BASE_URL", "http://127.0.0.1:5000")
 
 # ---------------------------------------------------------------------------
 # Extension property registry
