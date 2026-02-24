@@ -7,18 +7,12 @@ the Data Extension API, allowing OpenRefine to:
   2. Extend reconciled rows with additional columns pulled from TMDB — genres,
      runtime, cast, director, tagline, revenue, and more.
 
-Reconciliation flow:
-  OpenRefine → POST /reconcile?queries=... → this service searches TMDB,
-  scores candidates, and returns the best matches.
-
-Data extension flow:
-  OpenRefine → POST /reconcile?extend=... → this service fetches full TMDB
-  details for already-matched movie IDs and returns the requested properties
-  as structured values.
-
-Property suggestion flow:
-  OpenRefine → GET /suggest/properties?prefix=... → returns the list of
-  available extension properties so users can pick them in the UI.
+Key API flows:
+  Registration:  GET  /reconcile           → service metadata (handshake)
+  Reconcile:     POST /reconcile?queries=… → scored match candidates
+  Data extend:   POST /reconcile?extend=…  → property values for matched IDs
+  Prop suggest:  GET  /suggest/properties  → autocomplete in reconcile dialog
+  Prop propose:  GET  /propose_properties  → column picker in extend dialog
 """
 
 from flask import Flask, request, jsonify
@@ -41,20 +35,25 @@ TMDB_API_KEY     = os.getenv("TMDB_API_KEY")
 TMDB_SEARCH_URL  = "https://api.themoviedb.org/3/search/movie"
 TMDB_DETAILS_URL = "https://api.themoviedb.org/3/movie/{}"
 
+# The base URL OpenRefine will use to build links back to this service.
+# Change this if you deploy the service somewhere other than localhost.
+SERVICE_BASE_URL = "http://127.0.0.1:5000"
+
 # ---------------------------------------------------------------------------
 # Extension property registry
 # ---------------------------------------------------------------------------
-# This is the single source of truth for every property available via data
-# extension. Each entry has:
-#   id      - Stable identifier used in API requests/responses. Never rename.
-#   name    - Human-readable label shown in OpenRefine's "Add columns" dialog.
-#   type    - "str", "int", "float", or "entity".
-#             "entity" means the value is a named thing (person, genre, etc.)
-#             and OpenRefine will render it as a linkable reconciled cell.
+# Single source of truth for every property available via data extension.
+#
+# Fields:
+#   id   – Stable identifier used in API requests/responses. Never rename.
+#   name – Human-readable label shown in OpenRefine's "Add columns" dialog.
+#   type – "str", "int", "float", or "entity".
+#           "entity" → value is a named thing (person, genre, etc.) that
+#           OpenRefine can render as a linkable, reconcilable cell.
 #
 # To add a new property:
-#   1. Append an entry to this list.
-#   2. Add a branch for its "id" in extract_property_value() below.
+#   1. Append an entry here.
+#   2. Add a matching branch in extract_property_value() below.
 # ---------------------------------------------------------------------------
 
 EXTENSION_PROPERTIES = [
@@ -79,7 +78,7 @@ EXTENSION_PROPERTIES = [
     {"id": "imdb_id",              "name": "IMDb ID",               "type": "str"},
 ]
 
-# Quick lookup by property id, used in handle_extend() and suggest_properties()
+# Quick lookup by property id
 PROPERTY_MAP = {p["id"]: p for p in EXTENSION_PROPERTIES}
 
 
@@ -99,7 +98,7 @@ def normalize_title(title):
       5. Collapse multiple spaces and lower-case.
 
     Handles: accented chars (León→leon), punctuation (L.A. Confidential),
-    hyphenation differences (Spider-Man vs Spider Man).
+    hyphenation (Spider-Man vs Spider Man).
     """
     title = unicodedata.normalize("NFKD", title)
     title = "".join(c for c in title if not unicodedata.combining(c))
@@ -112,8 +111,7 @@ def normalize_title(title):
 def titles_match(a, b):
     """
     Return True if two titles are equal after full normalisation.
-    Centralising this avoids bugs where some comparisons used only .lower()
-    and missed diacritics or punctuation differences.
+    Centralised so all comparisons use identical logic.
     """
     return normalize_title(a) == normalize_title(b)
 
@@ -124,11 +122,11 @@ def titles_match(a, b):
 
 def score_year(tmdb_year, input_year):
     """
-    Score bonus/penalty based on release year proximity.
-      Exact match  → +20
-      Within 2 yrs → +10  (handles films that straddle calendar years)
-      Further off  → -10
-    Returns 0 if either year is missing or unparseable.
+    Bonus/penalty based on release year proximity.
+      Exact       → +20
+      Within 2yr  → +10  (catches films that straddle calendar years)
+      Further off → -10
+    Returns 0 if either value is missing/unparseable.
     """
     if not tmdb_year or not input_year:
         return 0
@@ -143,12 +141,10 @@ def score_year(tmdb_year, input_year):
 
 def score_director(tmdb_credits, input_director):
     """
-    Score bonus/penalty based on fuzzy director name match.
-
-    Uses thefuzz token_sort_ratio so that name order differences
-    ("Kubrick Stanley" vs "Stanley Kubrick") don't cause misses.
-    Threshold ≥60 similarity → +20; below → -10.
-    Returns 0 if no director was supplied or thefuzz is unavailable.
+    Bonus/penalty based on fuzzy director name match.
+    token_sort_ratio handles name-order differences ("Kubrick Stanley" still
+    matches "Stanley Kubrick"). Threshold ≥60 → +20; below → -10.
+    Returns 0 if no director supplied or thefuzz unavailable.
     """
     if not input_director:
         return 0
@@ -170,12 +166,11 @@ def score_director(tmdb_credits, input_director):
 
 def score_country(tmdb_details, input_country):
     """
-    Score bonus/penalty based on production country match.
-
-    Input may be comma-separated ("USA, United Kingdom"). Substring matching
-    handles common abbreviations ("USA" ↔ "United States of America").
+    Bonus/penalty based on production country match.
+    Input may be comma-separated. Substring matching handles abbreviations
+    ("USA" ↔ "United States of America").
       Any match → +10;  no match → -5.
-    Returns 0 if no country was supplied.
+    Returns 0 if no country supplied.
     """
     if not input_country:
         return 0
@@ -197,20 +192,15 @@ def score_country(tmdb_details, input_country):
 
 def get_movie_details(movie_id, append="credits"):
     """
-    Fetch movie details for a TMDB ID, optionally bundling sub-requests via
-    TMDB's append_to_response feature (single HTTP call instead of multiple).
+    Fetch movie details + optional sub-requests in a single HTTP call using
+    TMDB's append_to_response feature.
 
     Parameters:
-      movie_id - TMDB numeric movie ID (int or str).
-      append   - Comma-separated sub-endpoints to bundle, e.g. "credits".
-                 Default is "credits" since director/cast are frequently needed.
+      movie_id – TMDB numeric movie ID.
+      append   – Comma-separated sub-endpoints to bundle (default: "credits").
 
-    Returns (details_dict, credits_dict):
-      details_dict - Top-level metadata: genres, runtime, countries, budget…
-      credits_dict - cast and crew lists (empty dict if not appended).
-
-    On any error (network, non-200, bad JSON) returns ({}, {}) so the caller
-    can degrade gracefully rather than crashing the whole batch.
+    Returns (details_dict, credits_dict).
+    On any error returns ({}, {}) so callers degrade gracefully.
     """
     try:
         r = requests.get(
@@ -220,10 +210,10 @@ def get_movie_details(movie_id, append="credits"):
         )
         r.raise_for_status()
         data    = r.json()
-        credits = data.pop("credits", {})  # Nested when append_to_response is used
+        credits = data.pop("credits", {})
         return data, credits
     except requests.exceptions.RequestException as e:
-        print(f"[TMDB] Network error fetching movie {movie_id}: {e}")
+        print(f"[TMDB] Network error for movie {movie_id}: {e}")
         return {}, {}
     except (ValueError, KeyError) as e:
         print(f"[TMDB] Bad response for movie {movie_id}: {e}")
@@ -232,8 +222,8 @@ def get_movie_details(movie_id, append="credits"):
 
 def search_tmdb_api(query, year=None):
     """
-    Low-level wrapper around the TMDB movie search endpoint.
-    Returns a list of raw TMDB result dicts, or [] on any error.
+    Low-level TMDB movie search wrapper.
+    Returns a list of raw result dicts, or [] on any error.
     """
     params = {"api_key": TMDB_API_KEY, "query": query}
     if year:
@@ -256,23 +246,16 @@ def search_tmdb_api(query, year=None):
 
 def search_tmdb(query, year=None, director=None, country=None):
     """
-    Search TMDB for a movie and return a scored, ranked list of candidates
-    formatted for the OpenRefine Reconciliation API.
+    Search TMDB and return a scored, ranked list of candidates for OpenRefine.
 
     Strategy:
-      1. If a year is given, search year±1 to handle edge-case release dates.
-      2. Auto-match immediately if exactly one candidate matches both title and
-         year — skips expensive scoring for unambiguous cases.
-      3. Supplement with a general (no-year) search for robustness.
-      4. Score each candidate: title match + year/director/country bonuses.
+      1. Year-scoped searches (year±1) if year provided.
+      2. Auto-match if exactly one candidate matches title + year exactly.
+      3. General (no-year) search to fill remaining candidate pool.
+      4. Score each candidate on title, year, director, country.
       5. Set match=True based on confidence thresholds.
 
-    Returns a list of dicts, each with:
-      id    - TMDB movie ID (string)
-      name  - Movie title
-      score - 0–100
-      match - True if OpenRefine should auto-accept this result
-      type  - [{"id": "movie", "name": "Movie"}]
+    Returns list of dicts: {id, name, score, match, type}
     """
     all_movies = []
     seen_ids   = set()
@@ -285,7 +268,7 @@ def search_tmdb(query, year=None, director=None, country=None):
                     all_movies.append(movie)
                     seen_ids.add(movie["id"])
 
-        # --- Step 2: Try for an unambiguous auto-match ---
+        # --- Step 2: Auto-match on unambiguous title+year hit ---
         exact = []
         for movie in all_movies:
             tmdb_yr = movie.get("release_date", "")[:4]
@@ -302,13 +285,13 @@ def search_tmdb(query, year=None, director=None, country=None):
                      "score": 100, "match": True,
                      "type": [{"id": "movie", "name": "Movie"}]}]
 
-    # --- Step 3: General search to fill remaining candidates ---
+    # --- Step 3: General search ---
     for movie in search_tmdb_api(query):
         if movie["id"] not in seen_ids:
             all_movies.append(movie)
             seen_ids.add(movie["id"])
 
-    # --- Step 4: Score each candidate (cap at 10 for performance) ---
+    # --- Step 4: Score each candidate ---
     results = []
     for movie in all_movies[:10]:
         base_score    = 60 if titles_match(movie.get("title", ""), query) else 30
@@ -317,7 +300,6 @@ def search_tmdb(query, year=None, director=None, country=None):
 
         director_bonus = country_bonus = 0
         if director or country:
-            # Single API call returns both details and credits
             details, credits = get_movie_details(movie["id"])
             director_bonus   = score_director(credits, director)
             country_bonus    = score_country(details, country)
@@ -332,9 +314,7 @@ def search_tmdb(query, year=None, director=None, country=None):
         })
 
     # --- Step 5: Set match flags ---
-    # If there is only one candidate with an exact title, auto-match it.
-    # If there are multiple title matches, require a higher score (≥80) to
-    # avoid false positives on common titles (e.g. "The Fly", "Dracula").
+    # Sole exact-title match → auto-accept. Multiple candidates → require ≥80.
     high_conf = [r for r in results if r["score"] >= 60]
     for result in results:
         if len(high_conf) == 1 and result["score"] >= 60:
@@ -352,69 +332,46 @@ def search_tmdb(query, year=None, director=None, country=None):
 
 def extract_property_value(prop_id, details, credits):
     """
-    Extract and format the value(s) for one extension property from TMDB data.
+    Extract and format value(s) for one extension property from TMDB data.
 
-    The OpenRefine Data Extension spec expects each property value to be a list
-    of "cell objects" in one of these shapes:
+    OpenRefine Data Extension cell formats:
       Plain string:  {"str": "some text"}
       Integer:       {"int": 123}
       Float:         {"float": 8.5}
       Named entity:  {"id": "tmdb-id", "name": "Display Name"}
 
-    Entity cells are special: OpenRefine renders them as linkable items that
-    can themselves be reconciled against another service later. Use them for
-    anything that is a discrete named thing (person, genre, company, country).
-
-    Returns a list of cell objects (may contain None; filter these out in the
-    caller). Returns [] for unknown property IDs or missing data.
-
-    To add a new property: add a branch below and a matching entry in
-    EXTENSION_PROPERTIES at the top of this file.
+    Entity cells can be further reconciled in OpenRefine against other services.
+    Returns a list of cell objects (caller filters out None values).
+    Returns [] for unknown property IDs or missing data.
     """
 
     def str_cell(value):
         return {"str": str(value)} if value else None
 
     def int_cell(value):
-        if value is None:
-            return None
+        # TMDB uses 0 for "unknown" budget/revenue — treat as missing
+        if value is None: return None
         try:
             v = int(value)
-            # TMDB uses 0 to mean "unknown" for budget/revenue — treat as missing
             return {"int": v} if v != 0 else None
         except (ValueError, TypeError):
             return None
 
     def float_cell(value):
-        if value is None:
-            return None
+        if value is None: return None
         try:
             return {"float": float(value)}
         except (ValueError, TypeError):
             return None
 
     def entity_cell(entity_id, name):
-        """
-        Create an entity cell. entity_id should be a stable identifier
-        (TMDB numeric ID, ISO country code, etc.) so OpenRefine can use it
-        to reconcile this column against another service if the user wants.
-        """
-        if not name:
-            return None
+        if not name: return None
         return {"id": str(entity_id), "name": str(name)}
 
-    # --- Property branches ---
-
     if prop_id == "genres":
-        # e.g. [{"id": 28, "name": "Action"}, {"id": 12, "name": "Adventure"}]
-        return [
-            entity_cell(g["id"], g["name"])
-            for g in details.get("genres", [])
-            if g.get("name")
-        ]
+        return [entity_cell(g["id"], g["name"]) for g in details.get("genres", []) if g.get("name")]
 
     elif prop_id == "director":
-        # A film can have multiple directors (co-directed works)
         return [
             entity_cell(m["id"], m["name"])
             for m in credits.get("crew", [])
@@ -422,7 +379,7 @@ def extract_property_value(prop_id, details, credits):
         ]
 
     elif prop_id == "cast":
-        # Top 5 billed cast members; "order" is TMDB billing order (0 = top)
+        # Top 5 billed cast members
         top5 = sorted(
             [m for m in credits.get("cast", []) if m.get("name")],
             key=lambda m: m.get("order", 999)
@@ -446,18 +403,15 @@ def extract_property_value(prop_id, details, credits):
         return [cell] if cell else []
 
     elif prop_id == "original_language":
-        # ISO 639-1 code, e.g. "en", "fr", "ja"
         cell = str_cell(details.get("original_language"))
         return [cell] if cell else []
 
     elif prop_id == "original_title":
-        # Title in the film's original language (useful for non-English films)
         cell = str_cell(details.get("original_title"))
         return [cell] if cell else []
 
     elif prop_id == "production_countries":
-        # e.g. [{"iso_3166_1": "US", "name": "United States of America"}]
-        # Use ISO code as entity_id so it's stable and reconcilable
+        # Use ISO 3166-1 code as stable entity_id
         return [
             entity_cell(c["iso_3166_1"], c["name"])
             for c in details.get("production_countries", [])
@@ -465,7 +419,6 @@ def extract_property_value(prop_id, details, credits):
         ]
 
     elif prop_id == "production_companies":
-        # e.g. [{"id": 420, "name": "Marvel Studios", ...}]
         return [
             entity_cell(c["id"], c["name"])
             for c in details.get("production_companies", [])
@@ -473,7 +426,6 @@ def extract_property_value(prop_id, details, credits):
         ]
 
     elif prop_id == "budget":
-        # In USD; TMDB stores 0 when unknown (handled by int_cell)
         cell = int_cell(details.get("budget"))
         return [cell] if cell else []
 
@@ -482,7 +434,6 @@ def extract_property_value(prop_id, details, credits):
         return [cell] if cell else []
 
     elif prop_id == "vote_average":
-        # TMDB weighted average rating (0.0–10.0)
         cell = float_cell(details.get("vote_average"))
         return [cell] if cell else []
 
@@ -491,12 +442,10 @@ def extract_property_value(prop_id, details, credits):
         return [cell] if cell else []
 
     elif prop_id == "popularity":
-        # TMDB's internal popularity metric (higher = more popular recently)
         cell = float_cell(details.get("popularity"))
         return [cell] if cell else []
 
     elif prop_id == "status":
-        # e.g. "Released", "Post Production", "Planned", "Canceled"
         cell = str_cell(details.get("status"))
         return [cell] if cell else []
 
@@ -505,49 +454,35 @@ def extract_property_value(prop_id, details, credits):
         return [cell] if cell else []
 
     elif prop_id == "imdb_id":
-        # e.g. "tt0133093" — useful for cross-referencing with IMDb or Wikidata
         cell = str_cell(details.get("imdb_id"))
         return [cell] if cell else []
 
-    # Unknown property — return empty list so OpenRefine shows a blank cell
-    return []
+    return []  # Unknown property → blank cell
 
 
 def handle_extend(extend_data):
     """
-    Handle an OpenRefine Data Extension request and return formatted results.
+    Process an OpenRefine Data Extension request.
 
-    OpenRefine sends:
-      {
-        "ids":        ["123", "456"],     ← TMDB movie IDs (already reconciled)
-        "properties": [{"id": "genres"}, {"id": "director"}, ...]
-      }
+    Input (from OpenRefine):
+      {"ids": ["123", "456"], "properties": [{"id": "genres"}, ...]}
 
-    We return:
+    Output (to OpenRefine):
       {
-        "meta": [
-          {"id": "genres",   "name": "Genres",   "type": {"id": "entity"}},
-          {"id": "director", "name": "Director", "type": {"id": "entity"}},
-          ...
-        ],
+        "meta": [{"id": "genres", "name": "Genres", "type": {"id": "entity"}}, ...],
         "rows": {
-          "123": {
-            "genres":   [{"id": "28", "name": "Action"}, ...],
-            "director": [{"id": "578", "name": "James Cameron"}]
-          },
-          "456": { ... }
+          "123": {"genres": [{"id": "28", "name": "Action"}], ...},
+          ...
         }
       }
 
-    "meta" defines the column headers and types for the new columns.
-    "rows" maps each movie ID to its property values for those columns.
+    "meta" defines column headers + types for the new columns.
+    "rows" maps each TMDB movie ID to its property values.
     """
     requested_ids   = extend_data.get("ids", [])
     requested_props = extend_data.get("properties", [])
 
-    # Build meta: one entry per requested property.
-    # Look up each in our registry; fall back to a generic str entry for
-    # unknown IDs so unknown properties don't crash the whole request.
+    # Build meta block
     meta = []
     for prop in requested_props:
         pid  = prop["id"]
@@ -557,17 +492,15 @@ def handle_extend(extend_data):
             entry["type"] = {"id": "entity"}
         meta.append(entry)
 
-    # Build rows: one entry per movie ID.
-    # We always fetch credits alongside details since director and cast are
-    # the most commonly requested properties.
+    # Build rows block — one TMDB API call per movie (credits bundled in)
     rows = {}
     for movie_id in requested_ids:
         details, credits = get_movie_details(movie_id, append="credits")
         row = {}
         for prop in requested_props:
-            pid       = prop["id"]
-            values    = extract_property_value(pid, details, credits)
-            row[pid]  = [v for v in values if v is not None]
+            pid      = prop["id"]
+            values   = extract_property_value(pid, details, credits)
+            row[pid] = [v for v in values if v is not None]
         rows[movie_id] = row
 
     return {"meta": meta, "rows": rows}
@@ -582,40 +515,62 @@ def reconcile():
     """
     Combined reconciliation + data extension endpoint.
 
-    OpenRefine uses this single URL for three call types:
-      1. No parameters       → return service metadata (registration handshake).
-      2. 'queries' parameter → reconcile movie title queries against TMDB.
-      3. 'extend' parameter  → fetch extra columns for already-reconciled movies.
+    Three modes dispatched by which parameter OpenRefine sends:
+      (none)    → service metadata JSON (registration handshake)
+      queries=… → reconcile movie titles, return scored candidates
+      extend=…  → fetch extra columns for already-matched movie IDs
 
-    Supports JSONP via the 'callback' query parameter for older OpenRefine
-    versions that use cross-origin iframe communication.
+    IMPORTANT — service_metadata fields:
+      identifierSpace / schemaSpace:
+        Required by OpenRefine 3.1+. Without them OpenRefine has known bugs
+        where it silently drops the "extend" block and refuses data extension.
+        We use TMDB's own developer URI as the identifierSpace (the canonical
+        namespace for TMDB movie IDs) and a local URI for schemaSpace.
+
+      extend.propose_properties:
+        Points to our dedicated /propose_properties endpoint (NOT the same as
+        /suggest/properties). OpenRefine uses this specifically for the "Add
+        columns from reconciled values" dialog.
     """
     service_metadata = {
         "name": "TMDB Movie Reconciliation",
         "defaultTypes": [{"id": "movie", "name": "Movie"}],
-        # URL template for OpenRefine's "View match on TMDB" links
+
+        # Required by OpenRefine 3.1+ — absence causes bugs including
+        # silently ignoring the "extend" block. Values must be URIs.
+        "identifierSpace": "https://www.themoviedb.org/movie/",
+        "schemaSpace":     "https://www.themoviedb.org/documentation/api",
+
+        # URL template for "View on TMDB" links in the reconciliation sidebar
         "view": {"url": "https://www.themoviedb.org/movie/{{id}}"},
+
+        # Autocomplete endpoint for the "Add property" field in the
+        # reconciliation dialog (used to improve matching with year/director/country)
         "suggest": {
             "property": {
-                "service_url":  "http://127.0.0.1:5000",
+                "service_url":  SERVICE_BASE_URL,
                 "service_path": "/suggest/properties"
             }
         },
-        # Properties that can be used to IMPROVE reconciliation matching
+
+        # Properties accepted by the reconciliation endpoint to refine matches
         "properties": [
             {"id": "year",     "name": "Year"},
             {"id": "director", "name": "Director"},
             {"id": "country",  "name": "Country"}
         ],
-        # Advertise data extension support to OpenRefine.
-        # "propose_properties" tells OpenRefine where to fetch the list of
-        # available extension columns (reuses our suggest/properties endpoint).
+
+        # Data extension configuration.
+        # propose_properties MUST point to a SEPARATE endpoint from suggest/properties.
+        # OpenRefine calls propose_properties to populate the column picker in the
+        # "Add columns from reconciled values" dialog — it expects the full list of
+        # available extension properties, not reconciliation input properties.
         "extend": {
             "propose_properties": {
-                "service_url":  "http://127.0.0.1:5000",
-                "service_path": "/suggest/properties"
+                "service_url":  SERVICE_BASE_URL,
+                "service_path": "/propose_properties"
             },
-            "property_settings": []  # No per-property configuration needed
+            "property_settings": []
         }
     }
 
@@ -624,7 +579,7 @@ def reconcile():
     callback    = request.args.get("callback")
 
     if queries_raw:
-        # --- Mode 2: Reconciliation ---
+        # Reconciliation mode: score and rank TMDB candidates for each query
         queries = json.loads(queries_raw)
         results = {}
         for key, val in queries.items():
@@ -638,13 +593,14 @@ def reconcile():
         response = jsonify(results)
 
     elif extend_raw:
-        # --- Mode 3: Data Extension ---
+        # Data extension mode: fetch property values for reconciled movie IDs
         response = jsonify(handle_extend(json.loads(extend_raw)))
 
     else:
-        # --- Mode 1: Service metadata ---
+        # Metadata mode: return service descriptor so OpenRefine can register us
         response = jsonify(service_metadata)
 
+    # JSONP support for older OpenRefine versions using cross-origin iframes
     if callback:
         return (
             f"{callback}({response.get_data(as_text=True)})",
@@ -655,34 +611,90 @@ def reconcile():
     return response
 
 
+@app.route("/propose_properties", methods=["GET"])
+def propose_properties():
+    """
+    Data extension property proposal endpoint.
+
+    OpenRefine calls this when the user opens "Add columns from reconciled
+    values..." to populate the list of available columns to import.
+
+    This is a SEPARATE endpoint from /suggest/properties (which handles
+    autocomplete in the reconciliation input dialog). Mixing the two causes
+    OpenRefine to either show no columns or fail to recognise extension support.
+
+    Request params:
+      type    – The entity type being extended (we only have "movie"; ignored).
+      limit   – Max results to return (optional; we return all matches).
+      prefix  – Filter by name prefix (optional).
+      callback – JSONP callback (optional).
+
+    Response format (OpenRefine Data Extension spec):
+      {
+        "type": {"id": "movie", "name": "Movie"},
+        "properties": [
+          {"id": "genres", "name": "Genres"},
+          {"id": "director", "name": "Director"},
+          ...
+        ]
+      }
+    """
+    prefix   = request.args.get("prefix", "").lower()
+    limit    = request.args.get("limit", type=int)
+    callback = request.args.get("callback")
+
+    # Filter by prefix if provided
+    filtered = [
+        p for p in EXTENSION_PROPERTIES
+        if prefix in p["name"].lower()
+    ]
+    if limit:
+        filtered = filtered[:limit]
+
+    # Build response in the propose_properties format (note: no "result" wrapper —
+    # this endpoint uses a different envelope than suggest/properties)
+    result = {
+        "type":       {"id": "movie", "name": "Movie"},
+        "properties": [{"id": p["id"], "name": p["name"]} for p in filtered]
+    }
+
+    if callback:
+        return (
+            f"{callback}({json.dumps(result)})",
+            200,
+            {"Content-Type": "application/javascript"}
+        )
+
+    return jsonify(result)
+
+
 @app.route("/suggest/properties", methods=["GET"])
 def suggest_properties():
     """
-    Property suggestion endpoint — serves two purposes:
+    Property suggestion endpoint for the reconciliation input dialog.
 
-      1. Reconciliation dialog: lets users pick year/director/country to
-         improve match quality. (These are listed in service_metadata.properties.)
-      2. Data extension dialog: lets users browse and pick which TMDB properties
-         to pull in as new columns. (Registered in service_metadata.extend.)
+    OpenRefine calls this when the user types in the "Add property" field
+    during reconciliation setup, to autocomplete year/director/country.
 
-    OpenRefine sends 'prefix' with whatever the user has typed; we return all
-    properties whose name contains that substring (case-insensitive).
+    This endpoint is ONLY for reconciliation INPUT properties (the ones used
+    to improve matching). It is NOT used for data extension column picking —
+    that is handled by /propose_properties above.
 
-    Extension properties include a "type" field; OpenRefine uses this to know
-    whether to render a column as plain text or as reconcilable entity links.
+    Response format (suggest API):
+      {"result": [{"id": "year", "name": "Year"}, ...]}
     """
+    # Only the reconciliation input properties belong here
+    recon_properties = [
+        {"id": "year",     "name": "Year"},
+        {"id": "director", "name": "Director"},
+        {"id": "country",  "name": "Country"}
+    ]
+
     prefix   = request.args.get("prefix", "").lower()
     callback = request.args.get("callback")
 
-    filtered = []
-    for p in EXTENSION_PROPERTIES:
-        if prefix in p["name"].lower():
-            entry = {"id": p["id"], "name": p["name"]}
-            if p.get("type") == "entity":
-                entry["type"] = {"id": "entity"}
-            filtered.append(entry)
-
-    result = {"result": filtered}
+    filtered = [p for p in recon_properties if prefix in p["name"].lower()]
+    result   = {"result": filtered}
 
     if callback:
         return (
