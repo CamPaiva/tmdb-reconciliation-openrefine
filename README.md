@@ -8,15 +8,15 @@ Built by **Isadora Campregher Paiva**, film historian and lecturer at the Univer
 
 ## What it does
 
-This service allows you to reconcile a column of film titles in OpenRefine against TMDB. It supports optional additional columns to improve matching accuracy:
+This service allows you to reconcile a column of film titles in OpenRefine against TMDB, corresponding to their unique IDs. It supports optional additional columns to improve matching accuracy:
 
 - **Year** — matches within a ±2 year margin
 - **Director** — fuzzy matching to handle name variations (e.g. "F.W. Murnau", "Friedrich Wilhelm Murnau")
 - **Country** — supports co-productions listed with comma separation (e.g. "France, Italy")
 
-The service is designed to handle international cinema well, including films with translated titles, accented characters, and directors whose names are romanised differently across sources.
+The reconciliation service is designed to handle international cinema well, including films with translated titles, accented characters, and directors whose names are romanised differently across sources.
 
-Currently, the service reconciles film titles to their corresponding TMDB pages and IDs. **Data extension — which will allow users to add new columns from reconciled values (such as cast, director, runtime, genres, and more) — is planned for a future release.**
+**Data extension** — after a title is matched with a specific TMDB ID, new columns can be added based on TMDB data (such as cast, director, runtime, genres, IMDb ID, and more).
 
 ---
 
