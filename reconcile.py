@@ -536,6 +536,10 @@ def reconcile():
     """
     service_metadata = {
         "name": "TMDB Movie Reconciliation",
+        
+        # Declare supported API versions
+        "versions": ["0.1", "0.2"],
+
         "defaultTypes": [{"id": "movie", "name": "Movie"}],
 
         # Required by OpenRefine 3.1+ — absence causes bugs including
@@ -545,6 +549,13 @@ def reconcile():
 
         # URL template for "View on TMDB" links in the reconciliation sidebar
         "view": {"url": "https://www.themoviedb.org/movie/{{id}}"},
+
+        # Preview card shown when hovering over a candidate in OpenRefine
+        "preview": {
+            "url":    f"{SERVICE_BASE_URL}/preview/{{{{id}}}}",
+            "width":  400,
+            "height": 300
+        },
 
         # Autocomplete endpoint for the "Add property" field in the
         # reconciliation dialog (used to improve matching with year/director/country)
@@ -706,6 +717,65 @@ def suggest_properties():
         )
 
     return jsonify(result)
+
+@app.route("/preview/<movie_id>", methods=["GET"])
+def preview(movie_id):
+    """
+    Preview endpoint — called by OpenRefine when the user hovers over a
+    reconciliation candidate. Returns a small HTML card showing key facts
+    about the film so the user can confirm they have the right match before
+    accepting it.
+    """
+    details, credits = get_movie_details(movie_id, append="credits")
+
+    if not details:
+        return "<p>Movie not found.</p>", 404
+
+    title        = details.get("title", "Unknown")
+    year         = details.get("release_date", "")[:4] or "Unknown"
+    overview     = details.get("overview", "")
+    rating       = details.get("vote_average", "")
+    poster_path  = details.get("poster_path")
+    poster_url   = f"https://image.tmdb.org/t/p/w92{poster_path}" if poster_path else None
+    directors    = [m["name"] for m in credits.get("crew", []) if m.get("job") == "Director"]
+    director_str = ", ".join(directors) if directors else "Unknown"
+    genres       = ", ".join(g["name"] for g in details.get("genres", [])) or "Unknown"
+    tmdb_url     = f"https://www.themoviedb.org/movie/{movie_id}"
+
+    # Truncate overview so it fits in the preview card
+    if len(overview) > 200:
+        overview = overview[:200].rsplit(" ", 1)[0] + "…"
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ font-family: Arial, sans-serif; font-size: 13px; margin: 8px; color: #333; }}
+  .container {{ display: flex; gap: 10px; }}
+  img {{ width: 92px; flex-shrink: 0; border-radius: 4px; }}
+  h2 {{ margin: 0 0 4px 0; font-size: 15px; }}
+  .meta {{ color: #666; margin: 2px 0; font-size: 12px; }}
+  .overview {{ margin-top: 6px; line-height: 1.4; }}
+  a {{ color: #01b4e4; text-decoration: none; font-size: 12px; }}
+</style>
+</head>
+<body>
+<div class="container">
+  {"<img src='" + poster_url + "' alt='poster'>" if poster_url else ""}
+  <div>
+    <h2>{title} ({year})</h2>
+    <p class="meta">Director: {director_str}</p>
+    <p class="meta">Genres: {genres}</p>
+    <p class="meta">TMDB Rating: {rating}</p>
+    <p class="overview">{overview}</p>
+    <a href="{tmdb_url}" target="_blank">View on TMDB →</a>
+  </div>
+</div>
+</body>
+</html>"""
+
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ---------------------------------------------------------------------------
